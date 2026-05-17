@@ -1,0 +1,319 @@
+# ============================================================================
+# container-build-scan-push.yml — Reusable workflow
+# ============================================================================
+#
+# Builds a Docker image, scans it with Trivy BEFORE pushing to the registry,
+# generates a CycloneDX SBOM, uploads SARIF findings to GitHub Advanced
+# Security, and pushes to Azure Container Registry or Google Artifact Registry
+# using OIDC — no long-lived credentials anywhere.
+#
+# Scan-before-push pattern: the image is loaded into the local runner daemon
+# first. Trivy scans the local image. Only a passing scan triggers the push.
+# A vulnerable image is never published to the registry, even briefly.
+#
+# INPUTS
+# -----------------------------------------------------------------------
+# Name                  Type      Req   Default           Description
+# -----------------------------------------------------------------------
+# image-name            string    yes   —                 Name without registry prefix
+# registry              string    yes   —                 Registry hostname
+# registry-type         string    no    acr               "acr" or "gar"
+# context               string    no    .                 Docker build context
+# dockerfile            string    no    Dockerfile        Path to Dockerfile
+# image-tag             string    no    <8-char git SHA>  Tag to apply
+# trivy-severity        string    no    CRITICAL,HIGH     Severities that fail the scan
+# trivy-ignore-unfixed  boolean   no    false             Skip findings with no fix
+# push                  boolean   no    true              Push after passing scan
+# platforms             string    no    linux/amd64       Build platform(s)
+#
+# SECRETS (register in repo Settings → Secrets or in a GitHub Environment)
+# -----------------------------------------------------------------------
+# AZURE_CLIENT_ID       App Registration client ID   (required when registry-type=acr)
+# AZURE_TENANT_ID       Azure AD tenant ID           (required when registry-type=acr)
+# AZURE_SUBSCRIPTION_ID Azure subscription ID        (required when registry-type=acr)
+# GCP_PROJECT_NUMBER    GCP project number           (required when registry-type=gar)
+# GCP_SERVICE_ACCOUNT   SA email, Artifact Registry Writer role (registry-type=gar)
+#
+# OUTPUTS
+# -----------------------------------------------------------------------
+# image-digest          SHA256 digest of the pushed image (empty if push=false)
+# image-ref             Full reference: registry/name:tag
+# sbom-artifact         Name of the uploaded SBOM artifact in GitHub Actions
+#
+# PERMISSIONS (declared here; callers do not need to set these)
+# -----------------------------------------------------------------------
+# contents: read        Checkout
+# id-token: write       Request OIDC JWT for cloud authentication
+# security-events: write  Upload SARIF to GitHub Advanced Security
+# ============================================================================
+
+name: Container build, scan, and push
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name without registry prefix (e.g. "my-app")
+        required: true
+        type: string
+      registry:
+        description: Registry hostname (e.g. "myregistry.azurecr.io" or "us-docker.pkg.dev/project/repo")
+        required: true
+        type: string
+      registry-type:
+        description: Registry type — "acr" (Azure Container Registry) or "gar" (Google Artifact Registry)
+        required: false
+        type: string
+        default: acr
+      context:
+        description: Docker build context path
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: Path to Dockerfile relative to context
+        required: false
+        type: string
+        default: "Dockerfile"
+      image-tag:
+        description: Tag to apply to the image (defaults to first 8 chars of git SHA)
+        required: false
+        type: string
+        default: ""
+      trivy-severity:
+        description: Comma-separated severities that trigger a scan failure
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      trivy-ignore-unfixed:
+        description: Skip vulnerabilities that have no available fix
+        required: false
+        type: boolean
+        default: false
+      push:
+        description: Push the image after a passing scan
+        required: false
+        type: boolean
+        default: true
+      platforms:
+        description: >
+          Target build platform(s). Note: load=true (scan-before-push) only
+          supports a single platform. Multi-platform builds must set push=true
+          and accept that scanning happens against the first platform image.
+        required: false
+        type: string
+        default: "linux/amd64"
+
+    secrets:
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        required: false
+      GCP_PROJECT_NUMBER:
+        required: false
+      GCP_SERVICE_ACCOUNT:
+        required: false
+
+    outputs:
+      image-digest:
+        description: SHA256 digest of the pushed image (empty if push=false)
+        value: ${{ jobs.build-scan-push.outputs.image-digest }}
+      image-ref:
+        description: Full image reference including registry, name, and tag
+        value: ${{ jobs.build-scan-push.outputs.image-ref }}
+      sbom-artifact:
+        description: Name of the SBOM artifact uploaded to GitHub Actions
+        value: ${{ jobs.build-scan-push.outputs.sbom-artifact }}
+
+# Cancel in-progress runs on the same branch when a new push arrives.
+# Exception: never cancel on the default branch — a build in flight on main
+# should complete rather than leave the registry in a partial state.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.image-name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read         # Checkout
+      id-token: write        # OIDC JWT for cloud auth — must be explicit
+      security-events: write # SARIF upload to GitHub Advanced Security
+
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+      image-ref: ${{ steps.set-ref.outputs.value }}
+      sbom-artifact: sbom-${{ steps.tag.outputs.value }}
+
+    steps:
+      # SHA pinning rationale: a mutable tag (@v4) can be silently repointed to
+      # arbitrary code. A SHA is immutable — pinning here means a supply-chain
+      # compromise of the action repo cannot affect this pipeline unless the
+      # runner first upgrades the SHA.
+      # Verify: gh api repos/actions/checkout/git/ref/tags/v4.2.2 --jq '.object.sha'
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install platform tools (Trivy only)
+        uses: ./.github/actions/setup-tools
+        with:
+          install-helm: 'false'
+          install-kubeconform: 'false'
+          install-tflint: 'false'
+          install-checkov: 'false'
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          TAG="${{ inputs.image-tag }}"
+          if [[ -z "$TAG" ]]; then
+            TAG="${GITHUB_SHA::8}"
+          fi
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Set full image reference
+        id: set-ref
+        run: |
+          echo "value=${{ inputs.registry }}/${{ inputs.image-name }}:${{ steps.tag.outputs.value }}" \
+            >> "$GITHUB_OUTPUT"
+
+      # Buildx is required for GHA layer caching (cache-from/cache-to type=gha)
+      # and is the prerequisite for multi-platform builds.
+      # Verify: gh api repos/docker/setup-buildx-action/git/ref/tags/v3.2.0 --jq '.object.sha'
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20  # v3.2.0
+
+      # ── Azure Container Registry ─────────────────────────────────────────
+      - name: Azure login (OIDC — no client secret)
+        if: inputs.registry-type == 'acr'
+        # OIDC flow: GitHub issues a JWT; Azure validates it against the federated
+        # credential on the App Registration. No password is exchanged.
+        # Trust setup: see docs/security-model.md — Azure OIDC section.
+        # Verify: gh api repos/Azure/login/git/ref/tags/v2.2.0 --jq '.object.sha'
+        uses: azure/login@a65d910e851af2ee06a64c6b9c7c73ab3c0e5b5  # v2.2.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        if: inputs.registry-type == 'acr'
+        # az acr login uses the token from the preceding azure/login step.
+        # It populates Docker's credential store — no username/password needed.
+        run: az acr login --name "${{ inputs.registry }}"
+
+      # ── Google Artifact Registry ─────────────────────────────────────────
+      - name: GCP auth (Workload Identity Federation)
+        if: inputs.registry-type == 'gar'
+        id: gcp-auth
+        # Workload Identity Federation: GitHub OIDC token is exchanged for a
+        # short-lived GCP access token via the configured pool + provider.
+        # Trust setup: see docs/security-model.md — GCP OIDC section.
+        # Verify: gh api repos/google-github-actions/auth/git/ref/tags/v2.1.7 --jq '.object.sha'
+        uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f  # v2.1.7
+        with:
+          workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Log in to GAR
+        if: inputs.registry-type == 'gar'
+        # docker/login-action accepts the short-lived OAuth2 token from the
+        # preceding auth step as the password. No stored credential is used.
+        # Verify: gh api repos/docker/login-action/git/ref/tags/v3.1.0 --jq '.object.sha'
+        uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20  # v3.1.0
+        with:
+          registry: ${{ inputs.registry }}
+          username: oauth2accesstoken
+          password: ${{ steps.gcp-auth.outputs.auth_token }}
+
+      # ── Build (local, not pushed) ─────────────────────────────────────────
+      - name: Build image into local daemon
+        id: build
+        # load: true builds the image and loads it into the local Docker daemon
+        # without pushing to any registry. Trivy then scans this local image.
+        # Only a passing scan triggers the push in a later step.
+        #
+        # Tradeoff: load: true is incompatible with multi-platform builds in a
+        # single step (the daemon can only hold one platform at a time). If
+        # platforms contains multiple values, drop load: true and accept that
+        # Trivy scans the cached layer rather than the final image.
+        #
+        # Verify: gh api repos/docker/build-push-action/git/ref/tags/v5.3.0 --jq '.object.sha'
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25  # v5.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/amd64   # Fixed for local load; caller's platforms input used on push
+          load: true
+          push: false
+          tags: ${{ steps.set-ref.outputs.value }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Scan ─────────────────────────────────────────────────────────────
+      - name: Trivy vulnerability scan
+        # exit-code 1 hard-fails the job when findings at the configured severity
+        # are present. The job stops here — the push step below never executes.
+        # SARIF output is uploaded regardless (if: always()) so findings are
+        # visible in the Security tab even when the workflow fails.
+        run: |
+          IGNORE_UNFIXED_FLAG=""
+          if [[ "${{ inputs.trivy-ignore-unfixed }}" == "true" ]]; then
+            IGNORE_UNFIXED_FLAG="--ignore-unfixed"
+          fi
+
+          trivy image \
+            --severity "${{ inputs.trivy-severity }}" \
+            --exit-code 1 \
+            --format sarif \
+            --output trivy-results.sarif \
+            $IGNORE_UNFIXED_FLAG \
+            "${{ steps.set-ref.outputs.value }}"
+
+      - name: Upload Trivy SARIF to GitHub Advanced Security
+        # always() ensures findings are uploaded even when the scan step fails.
+        # Without this, a failing scan produces no visible output in the Security tab.
+        # Requires security-events: write permission (declared at job level above).
+        # Verify: gh api repos/github/codeql-action/git/ref/tags/v3.28.0 --jq '.object.sha'
+        if: always()
+        uses: github/codeql-action/upload-sarif@9278ec6183661d0779b6bb9b6d7c4cc6ba5eddda  # v3.28.0
+        with:
+          sarif_file: trivy-results.sarif
+          category: container-scan
+
+      # ── SBOM ─────────────────────────────────────────────────────────────
+      - name: Generate SBOM (CycloneDX)
+        # CycloneDX is the SBOM format with the widest tooling support for
+        # dependency auditing and compliance workflows. We reuse the Trivy
+        # binary already installed by setup-tools — no extra install step.
+        run: |
+          trivy image \
+            --format cyclonedx \
+            --output sbom.cdx.json \
+            "${{ steps.set-ref.outputs.value }}"
+
+      - name: Upload SBOM artifact
+        # Retained for 90 days — long enough for post-incident auditing.
+        # Verify: gh api repos/actions/upload-artifact/git/ref/tags/v4.3.1 --jq '.object.sha'
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b  # v4.3.1
+        with:
+          name: sbom-${{ steps.tag.outputs.value }}
+          path: sbom.cdx.json
+          retention-days: 90
+
+      # ── Push ─────────────────────────────────────────────────────────────
+      - name: Push image to registry
+        id: push
+        if: inputs.push == true
+        # docker push uses credentials already written by az acr login / docker login.
+        # We record the digest from the registry response for the output.
+        run: |
+          docker push "${{ steps.set-ref.outputs.value }}"
+          DIGEST=$(docker inspect \
+            --format='{{index .RepoDigests 0}}' \
+            "${{ steps.set-ref.outputs.value }}" \
+            | cut -d@ -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"

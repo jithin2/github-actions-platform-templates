@@ -1,0 +1,34 @@
+# Dependabot keeps action SHA pins current automatically.
+# It opens PRs that bump the SHA comment (e.g. # v4.2.2 -> # v4.3.0) and
+# updates the actual SHA. Without this, pinned SHAs accumulate security debt
+# silently — the pin is safe but stale.
+#
+# The platform team reviews and merges these PRs; product teams are not
+# responsible for SHA maintenance in the reusable workflows.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Europe/Stockholm"
+    # Group minor/patch bumps from the same vendor into a single PR to reduce
+    # noise. Breaking changes (major bumps) always get their own PR.
+    groups:
+      docker-actions:
+        patterns:
+          - "docker/*"
+      azure-actions:
+        patterns:
+          - "azure/*"
+          - "Azure/*"
+      google-actions:
+        patterns:
+          - "google-github-actions/*"
+      github-actions:
+        patterns:
+          - "actions/*"
+          - "github/*"

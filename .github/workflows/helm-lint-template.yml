@@ -1,0 +1,169 @@
+# ============================================================================
+# helm-lint-template.yml — Reusable workflow
+# ============================================================================
+#
+# Runs helm lint, renders templates with helm template, and validates the
+# rendered manifests against the upstream Kubernetes JSON schema using
+# kubeconform. No cloud credentials required — runs entirely within the
+# GitHub Actions runner.
+#
+# Why kubeconform instead of helm template --validate:
+#   --validate calls the live Kubernetes API server to validate manifests.
+#   That requires cluster credentials in CI, which is a security risk and
+#   a hard dependency. kubeconform validates against the published JSON
+#   schemas offline — same coverage, no cluster access, no credentials.
+#
+# INPUTS
+# -----------------------------------------------------------------------
+# Name                  Type      Req   Default    Description
+# -----------------------------------------------------------------------
+# chart-path            string    yes   —          Path to the Helm chart directory
+# values-file           string    no    ""         Additional values file for lint + template
+# release-name          string    no    ci-release Name used in helm template render
+# kubernetes-version    string    no    1.29.0     Target k8s version for schema validation
+# kubeconform-strict    boolean   no    true       Reject unknown fields (catches typos)
+# helm-args             string    no    ""         Extra flags for helm lint and template
+#
+# SECRETS
+# -----------------------------------------------------------------------
+# None — this workflow does not authenticate to any external service.
+#
+# OUTPUTS
+# -----------------------------------------------------------------------
+# (none) — validation only; no deployable artifact is produced.
+#
+# PERMISSIONS
+# -----------------------------------------------------------------------
+# contents: read   Checkout only
+# ============================================================================
+
+name: Helm lint, template, and validate
+
+on:
+  workflow_call:
+    inputs:
+      chart-path:
+        description: Path to the Helm chart directory (e.g. "charts/my-app")
+        required: true
+        type: string
+      values-file:
+        description: Optional values file passed to helm lint and helm template
+        required: false
+        type: string
+        default: ""
+      release-name:
+        description: Release name used when rendering templates with helm template
+        required: false
+        type: string
+        default: ci-release
+      kubernetes-version:
+        description: Target Kubernetes version for kubeconform schema validation
+        required: false
+        type: string
+        default: "1.29.0"
+      kubeconform-strict:
+        description: >
+          Fail on fields not defined in the schema. Catches typos like
+          "apiVersionn:" that helm lint accepts but will break at apply time.
+        required: false
+        type: boolean
+        default: true
+      helm-args:
+        description: Extra flags appended to helm lint and helm template (e.g. "--set image.tag=test")
+        required: false
+        type: string
+        default: ""
+
+# This workflow is read-only (no push, no registry write, no deploy).
+# cancel-in-progress: true is safe unconditionally — there is no state to corrupt.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.chart-path }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-template-validate:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read   # Checkout only — no cloud or registry access needed
+
+    steps:
+      # Verify: gh api repos/actions/checkout/git/ref/tags/v4.2.2 --jq '.object.sha'
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install platform tools (Helm + kubeconform only)
+        uses: ./.github/actions/setup-tools
+        with:
+          install-trivy: 'false'
+          install-tflint: 'false'
+          install-checkov: 'false'
+
+      - name: Helm lint
+        # helm lint validates chart structure, required values, and the chart's
+        # values.schema.json (if present). --strict promotes warnings to errors
+        # so lint failures are caught here rather than silently at deploy time.
+        run: |
+          VALUES_ARGS=""
+          if [[ -n "${{ inputs.values-file }}" ]]; then
+            VALUES_ARGS="--values ${{ inputs.values-file }}"
+          fi
+
+          helm lint "${{ inputs.chart-path }}" \
+            --strict \
+            $VALUES_ARGS \
+            ${{ inputs.helm-args }}
+
+      - name: Helm template
+        id: template
+        # Render all templates to a single YAML file. We do NOT pass --validate
+        # because that would call the live Kubernetes API — kubeconform handles
+        # schema validation offline in the next step.
+        run: |
+          VALUES_ARGS=""
+          if [[ -n "${{ inputs.values-file }}" ]]; then
+            VALUES_ARGS="--values ${{ inputs.values-file }}"
+          fi
+
+          helm template "${{ inputs.release-name }}" "${{ inputs.chart-path }}" \
+            $VALUES_ARGS \
+            ${{ inputs.helm-args }} \
+            > /tmp/rendered.yaml
+
+          DOC_COUNT=$(grep -c '^---' /tmp/rendered.yaml || true)
+          LINE_COUNT=$(wc -l < /tmp/rendered.yaml)
+          echo "Rendered ${LINE_COUNT} lines across ${DOC_COUNT} documents"
+
+      - name: Upload rendered manifests (debug artifact)
+        # Retained for 7 days — useful for debugging kubeconform failures without
+        # re-running the workflow. Not a deployable artifact.
+        # Verify: gh api repos/actions/upload-artifact/git/ref/tags/v4.3.1 --jq '.object.sha'
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b  # v4.3.1
+        with:
+          name: rendered-manifests-${{ github.run_id }}
+          path: /tmp/rendered.yaml
+          retention-days: 7
+
+      - name: kubeconform validation
+        # kubeconform downloads and caches the upstream Kubernetes JSON schemas
+        # for the specified version. It validates every document in the rendered
+        # manifest against those schemas.
+        #
+        # -strict: rejects fields not in the schema. Without this, a typo in a
+        # field name silently passes validation — the field is ignored at apply
+        # time, not rejected.
+        #
+        # -summary: prints a one-line pass/fail count at the end. Individual
+        # failures are printed inline by -output pretty.
+        run: |
+          STRICT_FLAG=""
+          if [[ "${{ inputs.kubeconform-strict }}" == "true" ]]; then
+            STRICT_FLAG="-strict"
+          fi
+
+          kubeconform \
+            -kubernetes-version "${{ inputs.kubernetes-version }}" \
+            -summary \
+            -output pretty \
+            $STRICT_FLAG \
+            /tmp/rendered.yaml

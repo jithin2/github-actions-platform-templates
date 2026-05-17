@@ -1,0 +1,124 @@
+# Composite action — install shared platform tooling at pinned versions.
+#
+# Called at the start of every platform workflow that needs these tools.
+# Centralising here means a single version bump in this file propagates to
+# every workflow that calls it — one PR to upgrade Trivy for all callers.
+#
+# Tool          Default version   Where to verify latest
+# -----------   ---------------   ------------------------------------------
+# Trivy         0.58.2            github.com/aquasecurity/trivy/releases
+# Helm          3.17.0            github.com/helm/helm/releases
+# kubeconform   0.6.7             github.com/yannh/kubeconform/releases
+# tflint        0.54.0            github.com/terraform-linters/tflint/releases
+# Checkov       3.2.350           pypi.org/project/checkov
+#
+# NOTE: tfsec is archived (last release 2023, repo archived 2024).
+# Checkov (Bridgecrew/Prisma Cloud) is the maintained successor for
+# Terraform IaC security scanning. Reference: github.com/aquasecurity/tfsec
+#
+# All tools are downloaded as binaries from their official release pages —
+# no intermediate installer actions that would themselves need SHA pinning.
+
+name: Setup platform tools
+description: >
+  Install and cache Trivy, Helm, kubeconform, tflint, and Checkov at
+  platform-pinned versions. Boolean inputs allow callers to skip tools
+  they do not need, keeping install time proportional to actual use.
+
+inputs:
+  install-trivy:
+    description: Install Trivy vulnerability scanner
+    default: 'true'
+  install-helm:
+    description: Install Helm
+    default: 'true'
+  install-kubeconform:
+    description: Install kubeconform Kubernetes manifest validator
+    default: 'true'
+  install-tflint:
+    description: Install tflint Terraform linter
+    default: 'true'
+  install-checkov:
+    description: Install Checkov IaC security scanner (pip)
+    default: 'true'
+
+  trivy-version:
+    description: Trivy release version (without v prefix)
+    default: '0.58.2'
+  helm-version:
+    description: Helm release version (without v prefix)
+    default: '3.17.0'
+  kubeconform-version:
+    description: kubeconform release version (without v prefix)
+    default: '0.6.7'
+  tflint-version:
+    description: tflint release version (without v prefix)
+    default: '0.54.0'
+  checkov-version:
+    description: Checkov PyPI version
+    default: '3.2.350'
+
+outputs:
+  trivy-version:
+    description: Installed Trivy version
+    value: ${{ inputs.trivy-version }}
+  helm-version:
+    description: Installed Helm version
+    value: ${{ inputs.helm-version }}
+  kubeconform-version:
+    description: Installed kubeconform version
+    value: ${{ inputs.kubeconform-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Trivy
+      if: inputs.install-trivy == 'true'
+      shell: bash
+      run: |
+        TRIVY_VERSION="${{ inputs.trivy-version }}"
+        curl -sSfL \
+          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+          | tar -xz -C /usr/local/bin trivy
+        trivy --version
+
+    - name: Install Helm
+      if: inputs.install-helm == 'true'
+      shell: bash
+      # Downloaded directly from helm.sh — no external action dependency.
+      run: |
+        HELM_VERSION="${{ inputs.helm-version }}"
+        curl -sSfL \
+          "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" \
+          | tar -xz --strip-components=1 -C /usr/local/bin linux-amd64/helm
+        helm version --short
+
+    - name: Install kubeconform
+      if: inputs.install-kubeconform == 'true'
+      shell: bash
+      run: |
+        KCONF_VERSION="${{ inputs.kubeconform-version }}"
+        curl -sSfL \
+          "https://github.com/yannh/kubeconform/releases/download/v${KCONF_VERSION}/kubeconform-linux-amd64.tar.gz" \
+          | tar -xz -C /usr/local/bin kubeconform
+        kubeconform -v
+
+    - name: Install tflint
+      if: inputs.install-tflint == 'true'
+      shell: bash
+      run: |
+        TFLINT_VERSION="${{ inputs.tflint-version }}"
+        curl -sSfL \
+          "https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/tflint_linux_amd64.zip" \
+          -o /tmp/tflint.zip
+        unzip -q -o /tmp/tflint.zip -d /usr/local/bin tflint
+        rm /tmp/tflint.zip
+        tflint --version
+
+    - name: Install Checkov
+      if: inputs.install-checkov == 'true'
+      shell: bash
+      # pip install is intentionally quiet; Checkov's verbose install pollutes logs.
+      run: |
+        pip install --quiet "checkov==${{ inputs.checkov-version }}"
+        checkov --version
