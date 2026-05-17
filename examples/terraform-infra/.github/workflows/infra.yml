@@ -1,0 +1,64 @@
+# ============================================================================
+# Example: Infrastructure repo — Terraform plan and apply
+# ============================================================================
+#
+# This file lives in a PRODUCT TEAM's infrastructure repository.
+# It calls the platform team's terraform-plan-apply workflow.
+#
+# Behaviour by trigger:
+#   pull_request → runs fmt/validate/tflint/Checkov/plan, posts plan as PR comment
+#   push to main → runs the same quality gate then applies
+#
+# SECRETS required in this product repo:
+#   AZURE_CLIENT_ID       — App Registration client ID for OIDC state + provider
+#   AZURE_TENANT_ID       — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID — Subscription to deploy into
+#
+# The App Registration needs:
+#   - Contributor on the target subscription (or scoped resource group)
+#   - Storage Blob Data Contributor on the tfstate storage account
+#   - Two federated credentials: one for PR triggers, one for main branch
+#
+# ============================================================================
+
+name: Infrastructure
+
+on:
+  push:
+    branches: [main]
+    # Only trigger when Terraform files change — skip CI for doc edits.
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+      - ".github/workflows/infra.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+      - ".github/workflows/infra.yml"
+
+# pull-requests: write is required for the plan comment on PRs.
+# id-token: write is required for OIDC auth to Azure.
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  plan-apply:
+    uses: jithin2/github-actions-platform-templates/.github/workflows/terraform-plan-apply.yml@v1.0.0
+    with:
+      working-directory: .
+      terraform-version: "1.9.8"
+      cloud-provider: azure
+      # backend-config-file contains the storage account, container, and key
+      # for remote state. Kept out of main.tf so the same code works across
+      # environments by swapping the backend config.
+      backend-config-file: backend.tfvars
+      apply-on-branch: main
+      # Both false by default — quality gates are hard failures.
+      # Set to true temporarily when migrating an existing codebase to this pipeline.
+      tflint-soft-fail: false
+      checkov-soft-fail: false
+    secrets: inherit

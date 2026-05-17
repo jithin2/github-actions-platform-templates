@@ -1,0 +1,68 @@
+# ============================================================================
+# Example: Containerised web app with Helm chart
+# ============================================================================
+#
+# This file lives in a PRODUCT TEAM's repository.
+# It calls the platform team's reusable workflows by full repo path + version.
+#
+# Replace "jithin2/github-actions-platform-templates" with your org's repo.
+# Replace "myregistry.azurecr.io" with your ACR hostname.
+#
+# SECRETS required in this product repo:
+#   AZURE_CLIENT_ID       — App Registration client ID for ACR OIDC push
+#   AZURE_TENANT_ID       — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID — Subscription containing the ACR
+#
+# HOW TO PIN: change @v1.0.0 to the latest release tag when you adopt a new
+# major version. Do not pin to @main — main is moving and may contain
+# unreleased breaking changes.
+# ============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Callers own their concurrency policy — the platform workflow adds its own
+# inner concurrency, but the outer group here prevents duplicate CI runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# id-token: write is required for the OIDC push to ACR.
+# security-events: write is required for Trivy SARIF upload to the Security tab.
+# pull-requests: write is not needed here (no terraform plan comment in this pipeline).
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+  # ── Helm validation ───────────────────────────────────────────────────────
+  # Runs in parallel with the container build — both are read-only checks
+  # that give fast feedback without needing to wait for each other.
+  helm-validate:
+    uses: jithin2/github-actions-platform-templates/.github/workflows/helm-lint-template.yml@v1.0.0
+    with:
+      chart-path: charts/app-with-helm
+      kubernetes-version: "1.29.0"
+      kubeconform-strict: true
+
+  # ── Container build, scan, push ───────────────────────────────────────────
+  build-scan-push:
+    uses: jithin2/github-actions-platform-templates/.github/workflows/container-build-scan-push.yml@v1.0.0
+    with:
+      image-name: app-with-helm
+      registry: myregistry.azurecr.io
+      registry-type: acr
+      # Only push on merges to main — scan still runs on PRs for early feedback,
+      # but the image is not published until the code is reviewed and merged.
+      push: ${{ github.event_name != 'pull_request' }}
+      trivy-severity: "CRITICAL,HIGH"
+    # secrets: inherit passes every secret in this repo to the reusable workflow.
+    # The workflow only reads the secrets it declares — AZURE_CLIENT_ID etc.
+    # All other secrets in this repo remain inaccessible to the workflow.
+    secrets: inherit

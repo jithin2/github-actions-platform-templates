@@ -1,0 +1,91 @@
+# ============================================================================
+# Example: ML model service — quality → build → deploy pipeline
+# ============================================================================
+#
+# This file lives in a PRODUCT TEAM's ML service repository.
+# It chains three platform workflows: quality gate → container build → ArgoCD deploy.
+#
+# Job order:
+#   quality        runs on every PR and push (pytest must pass before we build)
+#   build          runs after quality; only pushes the image on main
+#   deploy         runs after build; only on main (skipped on PRs)
+#
+# This ordering enforces: broken tests never produce a pushed image,
+# and no image reaches production without passing the vulnerability scan.
+#
+# SECRETS required in this product repo:
+#   GCP_PROJECT_NUMBER    — GCP project number for Workload Identity Federation
+#   GCP_SERVICE_ACCOUNT   — SA with Artifact Registry Writer role
+#   ARGOCD_SERVER         — ArgoCD server hostname (no https://)
+#   ARGOCD_AUTH_TOKEN     — ArgoCD token with sync + get on ml-model-service-prod
+#
+# ============================================================================
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+  # ── Stage 1: Python quality gate ─────────────────────────────────────────
+  # Runs first on every trigger. The build job is gated on this passing —
+  # a failing test suite never produces a Docker image.
+  quality:
+    uses: jithin2/github-actions-platform-templates/.github/workflows/python-quality.yml@v1.0.0
+    with:
+      python-version: "3.12"
+      source-path: src/
+      test-path: tests/
+      # Higher threshold than the default — ML services have well-scoped
+      # inference logic that is straightforward to test.
+      coverage-threshold: 85
+      mypy-soft-fail: false
+
+  # ── Stage 2: Container build, scan, push ─────────────────────────────────
+  # Only runs after quality passes. Scans before push — a vulnerable image
+  # is never published to the registry, even on main.
+  build:
+    needs: quality
+    uses: jithin2/github-actions-platform-templates/.github/workflows/container-build-scan-push.yml@v1.0.0
+    with:
+      image-name: ml-model-service
+      registry: us-docker.pkg.dev/my-gcp-project/ml-services
+      registry-type: gar
+      # Skip push on PRs — scan still runs for early vulnerability feedback.
+      push: ${{ github.event_name != 'pull_request' }}
+      # ML base images often have unfixed OS-level CVEs. Ignore those;
+      # fail only on findings where a fix is available.
+      trivy-ignore-unfixed: true
+      trivy-severity: "CRITICAL,HIGH"
+    secrets: inherit
+
+  # ── Stage 3: ArgoCD sync ─────────────────────────────────────────────────
+  # Only runs on push to main after a successful image push.
+  # ArgoCD reads the new image digest and applies it to the cluster.
+  # wait: true means this job does not complete until the deployment is Healthy.
+  deploy:
+    needs: build
+    # Skip entirely on PRs — no image was pushed, nothing to deploy.
+    if: github.event_name != 'pull_request'
+    uses: jithin2/github-actions-platform-templates/.github/workflows/argocd-sync.yml@v1.0.0
+    with:
+      app-name: ml-model-service-prod
+      revision: HEAD
+      wait: true
+      # ML model loading can be slow at startup — give the pod time to
+      # initialise before declaring the deployment unhealthy.
+      wait-timeout: 600
+      prune: false
+    secrets: inherit
