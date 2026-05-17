@@ -77,52 +77,107 @@ None — no cloud or registry authentication required.
 ## terraform-plan-apply
 
 **File:** `.github/workflows/terraform-plan-apply.yml`  
-**Purpose:** Run `terraform fmt`, `validate`, `tflint`, Checkov security scan,
-post the plan as a PR comment, and apply on merge to the default branch.
+**Purpose:** fmt → validate → tflint → Checkov → plan. Plan output posted as
+a PR comment (updated on each commit, not duplicated). Apply runs on push to
+the apply branch (default: `main`). Re-plans on apply — never reuses a stale
+plan file from the PR run.
 
-> Full input/output table added in Step 3.
+### Inputs
 
-### Required secrets
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `working-directory` | string | yes | — | Directory containing .tf files |
+| `terraform-version` | string | no | `1.9.8` | Terraform version |
+| `cloud-provider` | string | no | `azure` | `azure` or `gcp` for OIDC |
+| `backend-config-file` | string | no | `""` | Path to backend .tfvars |
+| `var-file` | string | no | `""` | Path to .tfvars for plan/apply |
+| `apply-on-branch` | string | no | `main` | Branch that triggers apply |
+| `tflint-soft-fail` | boolean | no | `false` | tflint findings as warnings |
+| `checkov-soft-fail` | boolean | no | `false` | Checkov findings as warnings |
 
-| Secret | Description |
+### Outputs
+
+| Name | Description |
 |---|---|
-| `AZURE_CLIENT_ID` | OIDC — if targeting Azure |
-| `AZURE_TENANT_ID` | OIDC — if targeting Azure |
-| `AZURE_SUBSCRIPTION_ID` | OIDC — if targeting Azure |
-| `GCP_PROJECT_NUMBER` | OIDC — if targeting GCP |
-| `GCP_SERVICE_ACCOUNT` | OIDC — if targeting GCP |
-| `TF_BACKEND_CONFIG` | Optional backend config override |
+| `plan-exit-code` | `0`=no changes, `1`=error, `2`=changes present |
+
+### Secrets
+
+| Secret | Required when | Description |
+|---|---|---|
+| `AZURE_CLIENT_ID` | `cloud-provider=azure` | OIDC App Registration client ID |
+| `AZURE_TENANT_ID` | `cloud-provider=azure` | Azure AD tenant ID |
+| `AZURE_SUBSCRIPTION_ID` | `cloud-provider=azure` | Azure subscription ID |
+| `GCP_PROJECT_NUMBER` | `cloud-provider=gcp` | GCP project number |
+| `GCP_SERVICE_ACCOUNT` | `cloud-provider=gcp` | SA email for WIF |
 
 ---
 
 ## argocd-sync
 
 **File:** `.github/workflows/argocd-sync.yml`  
-**Purpose:** Trigger an ArgoCD application sync via the ArgoCD API after an image
-has been promoted to the target registry.
+**Purpose:** Trigger ArgoCD app sync via CLI after image promotion. Optionally
+waits for Healthy + Synced status. Queues concurrent syncs for the same app
+(does not cancel in-progress — concurrent syncs would conflict in ArgoCD).
 
-> Full input/output table added in Step 3.
+### Inputs
 
-### Required secrets
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `app-name` | string | yes | — | ArgoCD application name |
+| `revision` | string | no | `HEAD` | Git revision to sync to |
+| `prune` | boolean | no | `false` | Remove resources absent from Git |
+| `wait` | boolean | no | `true` | Wait for Healthy + Synced |
+| `wait-timeout` | number | no | `300` | Seconds before timeout |
+| `argocd-version` | string | no | `2.13.0` | ArgoCD CLI version |
+| `insecure-skip-tls-verify` | boolean | no | `false` | Skip TLS cert verification |
 
-| Secret | Description |
+### Outputs
+
+| Name | Description |
 |---|---|
-| `ARGOCD_SERVER` | ArgoCD server hostname (no `https://` prefix) |
-| `ARGOCD_AUTH_TOKEN` | ArgoCD API token with sync permission on the target app |
+| `sync-status` | Final ArgoCD sync status (`Synced`, `OutOfSync`, etc.) |
+
+### Secrets
+
+| Secret | Required | Description |
+|---|---|---|
+| `ARGOCD_SERVER` | yes | Server hostname without `https://` |
+| `ARGOCD_AUTH_TOKEN` | yes | API token with sync + get on the target app |
 
 ---
 
 ## python-quality
 
 **File:** `.github/workflows/python-quality.yml`  
-**Purpose:** Run ruff lint + format check, mypy static type checking, and pytest
-with an enforced minimum coverage threshold.
+**Purpose:** ruff lint → ruff format check → mypy type checking → pytest with
+enforced coverage threshold. Tool versions are centrally pinned. ruff replaces
+flake8 + isort + black.
 
-> Full input/output table added in Step 3.
+### Inputs
 
-### Required secrets
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `python-version` | string | no | `3.12` | Python version |
+| `source-path` | string | no | `.` | Directory to lint/type-check |
+| `test-path` | string | no | `tests/` | Directory containing tests |
+| `coverage-threshold` | number | no | `80` | Minimum coverage % |
+| `ruff-version` | string | no | `0.8.6` | ruff PyPI version |
+| `mypy-version` | string | no | `1.13.0` | mypy PyPI version |
+| `pytest-version` | string | no | `8.3.4` | pytest PyPI version |
+| `pytest-cov-version` | string | no | `6.0.0` | pytest-cov PyPI version |
+| `mypy-soft-fail` | boolean | no | `false` | mypy errors as warnings |
+| `install-deps` | boolean | no | `true` | Install requirements*.txt |
 
-None — this workflow runs entirely in the GitHub Actions runner.
+### Outputs
+
+| Name | Description |
+|---|---|
+| `coverage-pct` | Final coverage percentage reported by pytest-cov |
+
+### Secrets
+
+None — runs entirely in the GitHub Actions runner.
 
 ---
 

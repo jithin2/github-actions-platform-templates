@@ -1,0 +1,193 @@
+# ============================================================================
+# argocd-sync.yml — Reusable workflow
+# ============================================================================
+#
+# Triggers an ArgoCD application sync via the ArgoCD CLI after an image has
+# been pushed to the registry. Optionally waits for the sync to reach
+# Healthy + Synced before completing.
+#
+# Calling pattern: this workflow is typically chained after
+# container-build-scan-push in a product team's pipeline:
+#
+#   jobs:
+#     build:
+#       uses: .../container-build-scan-push.yml@v1.0.0
+#     deploy:
+#       needs: build
+#       uses: .../argocd-sync.yml@v1.0.0
+#       with:
+#         app-name: my-app-prod
+#
+# The ArgoCD app itself is responsible for reading the new image tag from
+# the registry (via image updater or a values override). This workflow only
+# triggers the sync — it does not modify the Git manifests.
+#
+# INPUTS
+# -----------------------------------------------------------------------
+# Name                    Type     Req   Default  Description
+# -----------------------------------------------------------------------
+# app-name                string   yes   —        ArgoCD application name
+# revision                string   no    HEAD     Git revision to sync to
+# prune                   boolean  no    false    Remove resources absent from Git
+# wait                    boolean  no    true     Wait for Healthy + Synced status
+# wait-timeout            number   no    300      Seconds to wait before timing out
+# argocd-version          string   no    2.13.0   ArgoCD CLI version to install
+# insecure-skip-tls-verify boolean no   false    Skip TLS certificate verification
+#
+# SECRETS
+# -----------------------------------------------------------------------
+# ARGOCD_SERVER      ArgoCD server hostname — without https:// prefix
+#                    (e.g. "argocd.internal.example.com")
+# ARGOCD_AUTH_TOKEN  ArgoCD API token with sync + get permissions on the app
+#
+# OUTPUTS
+# -----------------------------------------------------------------------
+# sync-status   Final sync status from ArgoCD ("Synced", "OutOfSync", etc.)
+#
+# PERMISSIONS
+# -----------------------------------------------------------------------
+# contents: read   Checkout (needed to use composite actions at the repo path)
+# ============================================================================
+
+name: ArgoCD application sync
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: ArgoCD application name to sync
+        required: true
+        type: string
+      revision:
+        description: Git revision (branch, tag, or SHA) to sync to
+        required: false
+        type: string
+        default: HEAD
+      prune:
+        description: Remove Kubernetes resources that are no longer in Git
+        required: false
+        type: boolean
+        default: false
+      wait:
+        description: Wait for the application to reach Healthy + Synced after sync
+        required: false
+        type: boolean
+        default: true
+      wait-timeout:
+        description: Seconds to wait for Healthy + Synced before failing
+        required: false
+        type: number
+        default: 300
+      argocd-version:
+        description: ArgoCD CLI version to install (without v prefix)
+        required: false
+        type: string
+        default: "2.13.0"
+      insecure-skip-tls-verify:
+        description: Skip TLS certificate verification for the ArgoCD server
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      ARGOCD_SERVER:
+        required: true
+      ARGOCD_AUTH_TOKEN:
+        required: true
+
+    outputs:
+      sync-status:
+        description: Final ArgoCD sync status reported after the operation
+        value: ${{ jobs.sync.outputs.sync-status }}
+
+# Queue syncs for the same app; do not cancel in-progress syncs.
+# Two concurrent syncs of the same application would conflict in ArgoCD.
+# cancel-in-progress: false causes GitHub to queue the new run, not abort the current one.
+concurrency:
+  group: argocd-sync-${{ inputs.app-name }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read   # Required to resolve composite action path
+
+    outputs:
+      sync-status: ${{ steps.get-status.outputs.status }}
+
+    steps:
+      # Verify: gh api repos/actions/checkout/git/ref/tags/v4.2.2 --jq '.object.sha'
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Install ArgoCD CLI
+        # Downloaded directly from the argoproj release page — no intermediate
+        # installer action, no additional SHA to manage.
+        run: |
+          ARGOCD_VERSION="${{ inputs.argocd-version }}"
+          curl -sSfL \
+            "https://github.com/argoproj/argo-cd/releases/download/v${ARGOCD_VERSION}/argocd-linux-amd64" \
+            -o /usr/local/bin/argocd
+          chmod +x /usr/local/bin/argocd
+          argocd version --client
+
+      - name: ArgoCD login
+        # --grpc-web enables gRPC-web protocol, required when ArgoCD sits behind
+        # an HTTP/2-terminating proxy (common in enterprise ingress setups).
+        # --auth-token avoids storing a username/password.
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          INSECURE_FLAG=""
+          if [[ "${{ inputs.insecure-skip-tls-verify }}" == "true" ]]; then
+            INSECURE_FLAG="--insecure"
+          fi
+
+          argocd login "$ARGOCD_SERVER" \
+            --auth-token "$ARGOCD_AUTH_TOKEN" \
+            --grpc-web \
+            $INSECURE_FLAG
+
+      - name: Trigger ArgoCD sync
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+        run: |
+          PRUNE_FLAG=""
+          if [[ "${{ inputs.prune }}" == "true" ]]; then
+            PRUNE_FLAG="--prune"
+          fi
+
+          argocd app sync "${{ inputs.app-name }}" \
+            --revision "${{ inputs.revision }}" \
+            --grpc-web \
+            $PRUNE_FLAG
+
+      - name: Wait for Healthy + Synced
+        if: inputs.wait == true
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+        # --health: wait until the application reports Healthy
+        # --sync: wait until sync phase is complete
+        # --timeout: abort and fail the step after this many seconds
+        run: |
+          argocd app wait "${{ inputs.app-name }}" \
+            --health \
+            --sync \
+            --timeout "${{ inputs.wait-timeout }}" \
+            --grpc-web
+
+      - name: Get final sync status
+        id: get-status
+        if: always()
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+        run: |
+          STATUS=$(argocd app get "${{ inputs.app-name }}" \
+            --grpc-web \
+            --output json \
+            | jq -r '.status.sync.status // "Unknown"')
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "Sync status: $STATUS"

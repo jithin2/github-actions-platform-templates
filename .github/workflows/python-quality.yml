@@ -1,0 +1,206 @@
+# ============================================================================
+# python-quality.yml — Reusable workflow
+# ============================================================================
+#
+# Runs the Python quality gate in order: ruff lint → ruff format check →
+# mypy type checking → pytest with enforced coverage threshold.
+#
+# Tool choices:
+#   ruff:  replaces flake8 + isort + pyupgrade in a single binary, ~10-100x
+#          faster. Uses Rust. Format check replaces black.
+#   mypy:  static type analysis. Runs against the project's mypy.ini or
+#          pyproject.toml [tool.mypy] section if present.
+#   pytest + pytest-cov: standard test runner with coverage enforcement.
+#          --cov-fail-under is the hard gate; the workflow fails if coverage
+#          drops below the threshold.
+#
+# INPUTS
+# -----------------------------------------------------------------------
+# Name                Type     Req   Default   Description
+# -----------------------------------------------------------------------
+# python-version      string   no    3.12      Python version
+# source-path         string   no    .         Directory to lint/type-check
+# test-path           string   no    tests/    Directory containing tests
+# coverage-threshold  number   no    80        Minimum coverage % (0–100)
+# ruff-version        string   no    0.8.6     ruff PyPI version
+# mypy-version        string   no    1.13.0    mypy PyPI version
+# pytest-version      string   no    8.3.4     pytest PyPI version
+# pytest-cov-version  string   no    6.0.0     pytest-cov PyPI version
+# mypy-soft-fail      boolean  no    false     Treat mypy errors as warnings
+# install-deps        boolean  no    true      pip install requirements*.txt
+#
+# SECRETS
+# -----------------------------------------------------------------------
+# None — runs entirely within the GitHub Actions runner.
+#
+# OUTPUTS
+# -----------------------------------------------------------------------
+# coverage-pct   Final coverage percentage reported by pytest-cov
+#
+# PERMISSIONS
+# -----------------------------------------------------------------------
+# contents: read   Checkout only
+# ============================================================================
+
+name: Python quality gate
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: Python version for the runner
+        required: false
+        type: string
+        default: "3.12"
+      source-path:
+        description: Directory to run ruff and mypy against
+        required: false
+        type: string
+        default: "."
+      test-path:
+        description: Directory containing pytest tests
+        required: false
+        type: string
+        default: "tests/"
+      coverage-threshold:
+        description: Minimum test coverage percentage (0–100); below this the job fails
+        required: false
+        type: number
+        default: 80
+      ruff-version:
+        description: ruff PyPI version
+        required: false
+        type: string
+        default: "0.8.6"
+      mypy-version:
+        description: mypy PyPI version
+        required: false
+        type: string
+        default: "1.13.0"
+      pytest-version:
+        description: pytest PyPI version
+        required: false
+        type: string
+        default: "8.3.4"
+      pytest-cov-version:
+        description: pytest-cov PyPI version
+        required: false
+        type: string
+        default: "6.0.0"
+      mypy-soft-fail:
+        description: Downgrade mypy errors to warnings — useful while adding type hints to a legacy codebase
+        required: false
+        type: boolean
+        default: false
+      install-deps:
+        description: Install project dependencies from requirements.txt / requirements-dev.txt before running checks
+        required: false
+        type: boolean
+        default: true
+
+# Read-only; always safe to cancel in-progress on the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      coverage-pct: ${{ steps.coverage.outputs.pct }}
+
+    steps:
+      # Verify: gh api repos/actions/checkout/git/ref/tags/v4.2.2 --jq '.object.sha'
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # setup-python with cache: pip caches the pip download directory.
+      # The cache key includes the Python version and a hash of requirements files
+      # so the cache is invalidated when dependencies change.
+      # Verify: gh api repos/actions/setup-python/git/ref/tags/v5.1.0 --jq '.object.sha'
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@0b93645bdc223a139e5930c83c1a2c5abfe3f047  # v5.1.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      - name: Install quality tools
+        # Pinned versions match the workflow inputs — the platform team controls
+        # which tool versions all callers run, preventing tool version drift.
+        run: |
+          pip install --quiet \
+            "ruff==${{ inputs.ruff-version }}" \
+            "mypy==${{ inputs.mypy-version }}" \
+            "pytest==${{ inputs.pytest-version }}" \
+            "pytest-cov==${{ inputs.pytest-cov-version }}"
+
+      - name: Install project dependencies
+        if: inputs.install-deps == true
+        # Installs requirements.txt and requirements-dev.txt if they exist.
+        # Soft — if neither file exists, this step succeeds silently.
+        run: |
+          [[ -f requirements.txt ]]     && pip install --quiet -r requirements.txt     || true
+          [[ -f requirements-dev.txt ]] && pip install --quiet -r requirements-dev.txt || true
+
+      # ── Lint ─────────────────────────────────────────────────────────────
+      - name: ruff lint
+        # --output-format github produces inline annotations in the PR diff view.
+        # ruff replaces flake8, isort, and pyupgrade in a single pass.
+        run: |
+          ruff check "${{ inputs.source-path }}" \
+            --output-format github
+
+      - name: ruff format check
+        # --check exits non-zero if any file would be reformatted.
+        # --diff shows exactly what would change, so the author knows what to fix.
+        run: |
+          ruff format --check --diff "${{ inputs.source-path }}"
+
+      # ── Type check ────────────────────────────────────────────────────────
+      - name: mypy type check
+        # Uses the project's mypy.ini or pyproject.toml [tool.mypy] section if
+        # present. Falls back to mypy defaults if neither config file exists.
+        # mypy-soft-fail: true allows gradual adoption on legacy codebases — the
+        # step reports errors but does not fail the job.
+        continue-on-error: ${{ inputs.mypy-soft-fail }}
+        run: |
+          mypy "${{ inputs.source-path }}" \
+            --ignore-missing-imports \
+            --no-error-summary
+
+      # ── Tests ─────────────────────────────────────────────────────────────
+      - name: pytest with coverage
+        id: coverage
+        # --cov-fail-under is the hard gate. The job fails if coverage drops
+        # below the threshold, blocking merges until tests are added.
+        # coverage.xml is uploaded as an artifact for consumption by dashboards
+        # or PR comment tools (not done here to keep the workflow focused).
+        run: |
+          pytest "${{ inputs.test-path }}" \
+            --cov="${{ inputs.source-path }}" \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under="${{ inputs.coverage-threshold }}" \
+            --tb=short
+
+          # Extract the coverage percentage from the XML report for the output
+          PCT=$(python -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('coverage.xml')
+          pct = round(float(tree.getroot().get('line-rate', 0)) * 100, 1)
+          print(pct)
+          ")
+          echo "pct=$PCT" >> "$GITHUB_OUTPUT"
+          echo "Coverage: ${PCT}% (threshold: ${{ inputs.coverage-threshold }}%)"
+
+      - name: Upload coverage report
+        # Verify: gh api repos/actions/upload-artifact/git/ref/tags/v4.3.1 --jq '.object.sha'
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b  # v4.3.1
+        with:
+          name: coverage-${{ github.run_id }}
+          path: coverage.xml
+          retention-days: 30
