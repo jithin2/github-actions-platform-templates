@@ -1,0 +1,34 @@
+# Secrets and credentials — never commit these
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# Local tool caches
+.terraform/
+.tfsec/
+trivy-cache/
+
+# Test output
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor artifacts
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Workflow run artifacts (not source files — these belong in workflow artifact uploads)
+*.sarif
+sbom-*.json
+trivy-results-*.json
