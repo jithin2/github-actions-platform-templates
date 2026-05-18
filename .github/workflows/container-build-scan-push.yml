@@ -184,7 +184,7 @@ jobs:
       # and is the prerequisite for multi-platform builds.
       # Verify: gh api repos/docker/setup-buildx-action/git/ref/tags/v3.2.0 --jq '.object.sha'
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@2b51285047da1547ffb1b2203d8be4c0af6b1f20  # v3.2.0
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4.0.0
 
       # ── Azure Container Registry ─────────────────────────────────────────
       - name: Azure login (OIDC — no client secret)
@@ -223,7 +223,7 @@ jobs:
         # docker/login-action accepts the short-lived OAuth2 token from the
         # preceding auth step as the password. No stored credential is used.
         # Verify: gh api repos/docker/login-action/git/ref/tags/v3.1.0 --jq '.object.sha'
-        uses: docker/login-action@e92390c5fb421da1463c202d546fed0ec5c39f20  # v3.1.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121  # v4.1.0
         with:
           registry: ${{ inputs.registry }}
           username: oauth2accesstoken
@@ -242,7 +242,7 @@ jobs:
         # Trivy scans the cached layer rather than the final image.
         #
         # Verify: gh api repos/docker/build-push-action/git/ref/tags/v5.3.0 --jq '.object.sha'
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25  # v5.3.0
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v5.3.0
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
