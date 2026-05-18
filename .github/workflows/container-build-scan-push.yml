@@ -213,7 +213,7 @@ jobs:
         # short-lived GCP access token via the configured pool + provider.
         # Trust setup: see docs/security-model.md — GCP OIDC section.
         # Verify: gh api repos/google-github-actions/auth/git/ref/tags/v2.1.7 --jq '.object.sha'
-        uses: google-github-actions/auth@6fc4af4b145ae7821d527454aa9bd537d1f2dc5f  # v2.1.7
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
         with:
           workload_identity_provider: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
